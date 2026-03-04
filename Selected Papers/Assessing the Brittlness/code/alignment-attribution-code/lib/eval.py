@@ -265,6 +265,7 @@ def eval_attack(
     include_inst=True,
     save_attack_res=True,
     filename="",
+    model_family="llama2",
 ):
     """
     Evaluate the attack performance of a given model on AdvBench.
@@ -302,6 +303,7 @@ def eval_attack(
                 dataset=lines,
                 include_inst=include_inst,
                 gcg_suffix_id=i,
+                model_family=model_family,
             )
 
             # Generate outputs, check here for more options for the sampling params: https://github.com/vllm-project/vllm/blob/main/vllm/sampling_params.py
@@ -349,10 +351,12 @@ def eval_attack(
                 prompt_template_style=prompt_template_style,
                 dataset=lines,
                 include_inst=include_inst,
+                model_family=model_family,
             )
         else:
             dialogs = apply_prompt_template(
-                prompt_template_style="none", dataset=lines, include_inst=include_inst
+                prompt_template_style="none", dataset=lines, include_inst=include_inst,
+                model_family=model_family,
             )
 
         # Generate outputs, check here for more options for the sampling params: https://github.com/vllm-project/vllm/blob/main/vllm/sampling_params.py

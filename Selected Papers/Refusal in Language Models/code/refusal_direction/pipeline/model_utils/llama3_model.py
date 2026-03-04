@@ -94,15 +94,20 @@ def act_add_llama3_weights(model, direction: Float[Tensor, "d_model"], coeff, la
 class Llama3Model(ModelBase):
 
     def _load_model(self, model_path, dtype=torch.bfloat16):
-
-        model = AutoModelForCausalLM.from_pretrained(
-            model_path,
-            torch_dtype=dtype,
+        load_kwargs = dict(
             trust_remote_code=True,
             device_map="auto",
+        )
+        if "8B" in model_path or "8b" in model_path:
+            load_kwargs["load_in_8bit"] = True
+        else:
+            load_kwargs["torch_dtype"] = dtype
+
+        model = AutoModelForCausalLM.from_pretrained(
+            model_path, **load_kwargs
         ).eval()
 
-        model.requires_grad_(False) 
+        model.requires_grad_(False)
 
         return model
 

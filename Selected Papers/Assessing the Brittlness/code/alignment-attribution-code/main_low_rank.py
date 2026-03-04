@@ -30,29 +30,32 @@ print("# of gpus: ", torch.cuda.device_count())
 SAVE_PATH = "temp"
 
 modeltype2path = {
-    "llama2-7b-chat-hf": "",
-    "llama2-13b-chat-hf": "",
-    "llama2-7b-hf": "",
-    "llama2-13b-hf": "",
+    "llama2-7b-chat-hf": "meta-llama/Llama-2-7b-chat-hf",
+    "llama2-13b-chat-hf": "meta-llama/Llama-2-13b-chat-hf",
+    "llama2-7b-hf": "meta-llama/Llama-2-7b-hf",
+    "llama2-13b-hf": "meta-llama/Llama-2-13b-hf",
+    "llama3.1-8b-instruct": "unsloth/Meta-Llama-3.1-8B-Instruct",
+    "llama3.1-8b-base": "unsloth/Meta-Llama-3.1-8B",
 }
 
 
-def get_llm(model_name, cache_dir="llm_weights"):
-    if model_name in [
-        "llama2-7b-chat-hf",
-        "llama2-13b-chat-hf",
-        "llama2-7b-hf",
-        "llama2-13b-hf",
-    ]:
-        model = AutoModelForCausalLM.from_pretrained(
-            modeltype2path[model_name],
-            torch_dtype=torch.bfloat16,
-            cache_dir=cache_dir,
-            low_cpu_mem_usage=True,
-            device_map="auto",
-        )
+def is_llama3(model_name):
+    return "llama3" in model_name
 
-    model.seqlen = model.config.max_position_embeddings
+
+def get_llm(model_name, cache_dir="llm_weights"):
+    load_kwargs = dict(
+        torch_dtype=torch.float16,
+        cache_dir=cache_dir,
+        low_cpu_mem_usage=True,
+        device_map="auto",
+    )
+
+    model = AutoModelForCausalLM.from_pretrained(
+        modeltype2path[model_name], **load_kwargs
+    )
+
+    model.seqlen = min(model.config.max_position_embeddings, 4096)
     return model
 
 
@@ -122,12 +125,15 @@ def main():
     model = get_llm(args.model, args.cache_dir)
     model.eval()
     tokenizer = AutoTokenizer.from_pretrained(
-        modeltype2path[args.model], use_fast=False
+        modeltype2path[args.model], use_fast=True
     )
 
     if tokenizer.pad_token is None:
-        tokenizer.add_special_tokens({"pad_token": "[PAD]"})
-        model.resize_token_embeddings(len(tokenizer))
+        if is_llama3(args.model):
+            tokenizer.pad_token = tokenizer.eos_token
+        else:
+            tokenizer.add_special_tokens({"pad_token": "[PAD]"})
+            model.resize_token_embeddings(len(tokenizer))
 
     device = torch.device("cuda:0")
     if (
@@ -141,7 +147,8 @@ def main():
         tokenizer.save_pretrained(args.save_model)
 
     if args.prune_method == "low_rank":
-        make_low_rank(args, model, tokenizer, device, prune_data=args.prune_data)
+        model_family = "llama3" if is_llama3(args.model) else "llama2"
+        make_low_rank(args, model, tokenizer, device, prune_data=args.prune_data, model_family=model_family)
 
     ################################################################
     print("*" * 30)
@@ -176,17 +183,17 @@ def main():
             )
 
     if args.eval_attack:
-        # note: since vLLM only supports loading from the path, we need to save the pruned model first for faster evaluation. We can reuse this temp folder to save disk spaces
+        model_family = "llama3" if is_llama3(args.model) else "llama2"
         pruned_path = os.path.join(SAVE_PATH, f"tmp_vllm_model")
         model.save_pretrained(pruned_path)
+        tokenizer.save_pretrained(pruned_path)
         vllm_model = LLM(
             model=pruned_path,
-            tokenizer=modeltype2path[args.model],
+            tokenizer=pruned_path,
             dtype="bfloat16",
             swap_space=64,
+            max_model_len=4096,
         )
-        if True:
-            vllm_model.llm_engine.tokenizer.add_special_tokens({"pad_token": "[PAD]"})
         for include_inst in [True, False]:
             suffix = "inst_" if include_inst else "no_inst_"
             print("********************************")
@@ -200,6 +207,7 @@ def main():
                 save_attack_res=args.save_attack_res,
                 include_inst=include_inst,
                 filename=os.path.join(save_attackpath, f"{suffix}basic.jsonl"),
+                model_family=model_family,
             )
             print(f"attack evaluation results ({suffix}basic): {score:.4f}")
             with open(save_filepath, "a") as f:
@@ -219,6 +227,7 @@ def main():
                 save_attack_res=args.save_attack_res,
                 include_inst=include_inst,
                 filename=os.path.join(save_attackpath, f"{suffix}basic_no_sys.jsonl"),
+                model_family=model_family,
             )
             print(
                 f"attack evaluation results ({suffix}basic, no sys prompt): {score:.4f}"
@@ -242,6 +251,7 @@ def main():
                 filename=os.path.join(
                     save_attackpath, f"{suffix}multiple_no_sys.jsonl"
                 ),
+                model_family=model_family,
             )
             print(
                 f"attack evaluation results ({suffix}multiple, no sys prompt): {score:.4f}"
@@ -252,24 +262,26 @@ def main():
                     file=f,
                     flush=True,
                 )
-        score = eval_attack(
-            vllm_model,
-            tokenizer,
-            num_sampled=1,
-            add_sys_prompt=False,
-            gcg=True,
-            do_sample=False,
-            save_attack_res=args.save_attack_res,
-            include_inst=True,
-            filename=os.path.join(save_attackpath, f"gcg.jsonl"),
-        )
-        print(f"attack evaluation results (gcg): {score:.4f}")
-        with open(save_filepath, "a") as f:
-            print(
-                f"{args.prune_method}\t{args.rank}\tASR_gcg\t{score:.4f}",
-                file=f,
-                flush=True,
+        if model_family == "llama2":
+            score = eval_attack(
+                vllm_model,
+                tokenizer,
+                num_sampled=1,
+                add_sys_prompt=False,
+                gcg=True,
+                do_sample=False,
+                save_attack_res=args.save_attack_res,
+                include_inst=True,
+                filename=os.path.join(save_attackpath, f"gcg.jsonl"),
+                model_family=model_family,
             )
+            print(f"attack evaluation results (gcg): {score:.4f}")
+            with open(save_filepath, "a") as f:
+                print(
+                    f"{args.prune_method}\t{args.rank}\tASR_gcg\t{score:.4f}",
+                    file=f,
+                    flush=True,
+                )
         del vllm_model
 
     if args.eval_zero_shot:

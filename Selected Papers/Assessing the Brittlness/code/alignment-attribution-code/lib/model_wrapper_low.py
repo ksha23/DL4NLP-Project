@@ -13,7 +13,6 @@ from .data import get_loaders
 from functools import reduce
 import pickle
 
-
 class ActLinear(nn.Module):
     """
     drop in replacement of nn.Linear
@@ -126,7 +125,7 @@ def clear_act_buffer(act_model):
 
 
 def make_low_rank(
-    args, model, tokenizer, device=torch.device("cuda:0"), prune_data="wikitext"
+    args, model, tokenizer, device=torch.device("cuda:0"), prune_data="wikitext", model_family="llama2"
 ):
     model = make_Act(model, verbose=False)
     model.requires_grad_(False)
@@ -155,6 +154,7 @@ def make_low_rank(
         seqlen=model.seqlen,
         tokenizer=tokenizer,
         disentangle=args.disentangle,
+        model_family=model_family,
     )
     print("dataset loading complete")
 

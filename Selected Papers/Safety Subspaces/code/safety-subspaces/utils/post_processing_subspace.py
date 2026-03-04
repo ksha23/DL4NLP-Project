@@ -22,12 +22,13 @@ def load_state_dict(model_path: str):
     model = AutoModelForCausalLM.from_pretrained(
         model_path,
         torch_dtype=torch.float16,
-        device_map="auto",            # load weights onto GPU
-        low_cpu_mem_usage=True,         # faster, low‑overhead loading
+        device_map="cpu",
+        low_cpu_mem_usage=True,
         trust_remote_code=True,
     )
-    sd = model.state_dict()
+    sd = {k: v.cpu() for k, v in model.state_dict().items()}
     del model
+    gc.collect()
     return sd
 
 
@@ -81,11 +82,10 @@ def compute_raw_metrics(base_sd, aligned_sd, ft_sd, proj_sd):
     )
 
 
-def project_and_compute(base_sd, aligned_sd, ft_sd, device: torch.device, method_type: str, frac: float):
+def project_and_compute(base_sd, aligned_sd, ft_sd, device: torch.device, method_type: str, frac: float, dump_basis_dir: str = None):
     """Project updates on GPU and accumulate diagnostics in one pass."""
     new_sd = OrderedDict()
-    # accumulators for raw metrics
-    # same as in compute_raw_metrics but updated inline
+    basis_dict = {}
     dot_UU = dot_PP = dot_UP = dot_UV = dot_VV = 0.0
     layer_removed = defaultdict(float)
 
@@ -94,16 +94,14 @@ def project_and_compute(base_sd, aligned_sd, ft_sd, device: torch.device, method
             new_sd[name] = ft_sd[name]
             continue
 
-        # load into GPU and keep as float16
         wb = w_base.to(device)
         wa = aligned_sd[name].to(device)
         wf = ft_sd[name].to(device)
 
-        # differences in float32 for stable SVD
         V = (wa - wb).to(torch.float32)
         U = (wf - wa).to(torch.float32)
 
-        # compute projection subspace
+        L = None
         if V.ndim == 2:
             L = left_singular_basis(V, frac)
             if L is None:
@@ -119,10 +117,9 @@ def project_and_compute(base_sd, aligned_sd, ft_sd, device: torch.device, method
             coeff = (torch.sum(U.flatten() * V_flat) / denom) if denom else V.new_tensor(0.0)
             U_par = coeff * V
 
-        # diagnostics (in float32)
+        if dump_basis_dir is not None and L is not None:
+            basis_dict[name] = L.cpu()
 
-
-        # combine and cast back to float16
         U_par16 = U_par.to(torch.float16)
         if method_type == 'same':
             wp = wa + U_par16
@@ -143,11 +140,17 @@ def project_and_compute(base_sd, aligned_sd, ft_sd, device: torch.device, method
         layer_removed[layer] += torch.sum((U - P) * (U - P)).item()
 
         new_sd[name] = wp.cpu()
-        # clean up
         del wb, wa, wf, V, U, U_par, U_par16, wp, P
-        if 'L' in locals(): del L
+        if L is not None:
+            del L
+        torch.cuda.empty_cache()
 
-    # finalize metrics
+    if dump_basis_dir is not None and basis_dict:
+        Path(dump_basis_dir).mkdir(parents=True, exist_ok=True)
+        basis_path = os.path.join(dump_basis_dir, "alignment_basis.pt")
+        torch.save(basis_dict, basis_path)
+        print(f"· Saved {len(basis_dict)} alignment basis vectors to {basis_path}")
+
     eps = 1e-12
     metrics = dict(
         energy_kept_ratio=dot_PP / (dot_UU + eps),
@@ -173,6 +176,7 @@ def pretty_print_metrics(m):
 
 def merge_and_project(args, output_dir):
     device = torch.device(args.device)
+    dump_basis_dir = getattr(args, 'dump_basis', None)
 
     print("· Loading state‑dicts …")
     base_sd = load_state_dict(args.base_model_path)
@@ -182,7 +186,8 @@ def merge_and_project(args, output_dir):
     print(f"· Projecting with frac = {args.frac:.3f}, method_type = '{args.method_type}' …")
     with torch.no_grad():
         proj_sd, metrics = project_and_compute(
-            base_sd, aligned_sd, ft_sd, device, method_type=args.method_type, frac=args.frac
+            base_sd, aligned_sd, ft_sd, device, method_type=args.method_type, frac=args.frac,
+            dump_basis_dir=dump_basis_dir,
         )
 
     pretty_print_metrics(metrics)
@@ -239,6 +244,8 @@ if __name__ == "__main__":
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--method_type", default="orth", choices=["same", "opp", "orth"])
     parser.add_argument("--frac", type=float, default=0.10)
+    parser.add_argument("--dump_basis", type=str, default=None,
+                        help="Directory to save alignment SVD basis vectors for cross-method comparison")
 
     args = parser.parse_args()
 

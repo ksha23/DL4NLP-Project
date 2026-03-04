@@ -19,7 +19,7 @@ class TokenizerWrapper:
 
 
 # Load and process aligned dataset
-def get_align(nsamples, seed, seqlen, tokenizer, disentangle=False, mode="base"):
+def get_align(nsamples, seed, seqlen, tokenizer, disentangle=False, mode="base", model_family="llama2"):
     # Load train and test datasets
     if mode == "short":
         data_files = {"train": "./data/SFT_aligned_llama2-7b-chat-hf_train_short.csv"}
@@ -31,12 +31,24 @@ def get_align(nsamples, seed, seqlen, tokenizer, disentangle=False, mode="base")
     if disentangle:
         traindata_sampled = traindata.shuffle(seed=seed).select(range(nsamples))
         for i in range(nsamples):
-            trainenc_prompt = tokenizer(
-                traindata_sampled["prompt"][i], return_tensors="pt"
-            )
-            trainenc_response = tokenizer(
-                traindata_sampled["response"][i], return_tensors="pt"
-            )
+            if model_family == "llama3":
+                raw_prompt = traindata_sampled["prompt"][i]
+                raw_prompt = raw_prompt.replace("[INST]", "").replace("[/INST]", "").strip()
+                messages = [{"role": "user", "content": raw_prompt}]
+                prompt_text = tokenizer.apply_chat_template(
+                    messages, tokenize=False, add_generation_prompt=True
+                )
+                trainenc_prompt = tokenizer(prompt_text, return_tensors="pt")
+                trainenc_response = tokenizer(
+                    traindata_sampled["response"][i], return_tensors="pt", add_special_tokens=False
+                )
+            else:
+                trainenc_prompt = tokenizer(
+                    traindata_sampled["prompt"][i], return_tensors="pt"
+                )
+                trainenc_response = tokenizer(
+                    traindata_sampled["response"][i], return_tensors="pt"
+                )
             inp = torch.cat(
                 (trainenc_prompt.input_ids, trainenc_response.input_ids[:, 1:]), dim=1
             )
@@ -112,15 +124,15 @@ def get_alpaca(nsamples, seed, seqlen, tokenizer, disentangle=False, dataset="al
 
 # Function to select the appropriate loader based on dataset name
 def get_loaders(
-    name, nsamples=128, seed=0, seqlen=2048, tokenizer=None, disentangle=False
+    name, nsamples=128, seed=0, seqlen=2048, tokenizer=None, disentangle=False, model_family="llama2"
 ):
     if name == "wikitext":
         return get_wikitext2(nsamples, seed, seqlen, tokenizer)
     if name in ["alpaca", "alpaca_cleaned", "alpaca_cleaned_no_safety"]:
         return get_alpaca(nsamples, seed, seqlen, tokenizer, disentangle, dataset=name)
     if name == "align":
-        return get_align(nsamples, seed, seqlen, tokenizer, disentangle=disentangle)
+        return get_align(nsamples, seed, seqlen, tokenizer, disentangle=disentangle, model_family=model_family)
     if name == "align_short":
         return get_align(
-            nsamples, seed, seqlen, tokenizer, disentangle=disentangle, mode="short"
+            nsamples, seed, seqlen, tokenizer, disentangle=disentangle, mode="short", model_family=model_family
         )

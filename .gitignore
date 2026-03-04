@@ -1,0 +1,7 @@
+**/llm_weights/
+**/results/
+**/temp/
+**/__pycache__/
+*.pyc
+**/.locks/
+*.incomplete
