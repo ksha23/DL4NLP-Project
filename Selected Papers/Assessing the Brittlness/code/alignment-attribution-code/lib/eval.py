@@ -10,7 +10,6 @@ from collections import defaultdict
 import fnmatch
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from tqdm import tqdm
-from vllm import SamplingParams
 
 # Import get_loaders function from data module within the same directory
 from .data import get_loaders
@@ -287,6 +286,9 @@ def eval_attack(
         AssertionError: If save_attack_res is True but no filename is provided.
 
     """
+    # Lazy import to avoid initializing CUDA in the parent process
+    from vllm import SamplingParams
+
     # Load data and prepare the prompt
     # TODO: support other datasets
     with open("./data/advbench.txt") as f:

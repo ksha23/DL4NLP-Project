@@ -38,9 +38,16 @@ def get_align(nsamples, seed, seqlen, tokenizer, disentangle=False, mode="base",
                 prompt_text = tokenizer.apply_chat_template(
                     messages, tokenize=False, add_generation_prompt=True
                 )
-                trainenc_prompt = tokenizer(prompt_text, return_tensors="pt")
+                # apply_chat_template already includes <|begin_of_text|>, so
+                # use add_special_tokens=False to avoid a duplicate BOS token.
+                trainenc_prompt = tokenizer(prompt_text, return_tensors="pt", add_special_tokens=False)
                 trainenc_response = tokenizer(
                     traindata_sampled["response"][i], return_tensors="pt", add_special_tokens=False
+                )
+                # Neither part has an extra BOS, so concatenate directly
+                # (no [:, 1:] needed on response).
+                inp = torch.cat(
+                    (trainenc_prompt.input_ids, trainenc_response.input_ids), dim=1
                 )
             else:
                 trainenc_prompt = tokenizer(
@@ -49,9 +56,10 @@ def get_align(nsamples, seed, seqlen, tokenizer, disentangle=False, mode="base",
                 trainenc_response = tokenizer(
                     traindata_sampled["response"][i], return_tensors="pt"
                 )
-            inp = torch.cat(
-                (trainenc_prompt.input_ids, trainenc_response.input_ids[:, 1:]), dim=1
-            )
+                # Llama-2 tokenizer adds BOS to both; skip the response BOS.
+                inp = torch.cat(
+                    (trainenc_prompt.input_ids, trainenc_response.input_ids[:, 1:]), dim=1
+                )
             tar = inp.clone()
             trainenc_prompt_len = trainenc_prompt.input_ids.shape[1]
             tar[:, :trainenc_prompt_len] = -100
@@ -80,7 +88,7 @@ def get_wikitext2(nsamples, seed, seqlen, tokenizer):
     return None, testenc
 
 
-def get_alpaca(nsamples, seed, seqlen, tokenizer, disentangle=False, dataset="alpaca"):
+def get_alpaca(nsamples, seed, seqlen, tokenizer, disentangle=False, dataset="alpaca", model_family="llama2"):
     if dataset == "alpaca":
         data_files = {"train": "./data/alpaca_train.csv"}
     elif dataset == "alpaca_cleaned":
@@ -96,15 +104,35 @@ def get_alpaca(nsamples, seed, seqlen, tokenizer, disentangle=False, dataset="al
     if disentangle:
         traindata_sampled = traindata.shuffle(seed=seed).select(range(nsamples))
         for i in range(nsamples):
-            trainenc_prompt = tokenizer(
-                traindata_sampled["prompt"][i], return_tensors="pt"
-            )
-            trainenc_response = tokenizer(
-                traindata_sampled["response"][i], return_tensors="pt"
-            )
-            inp = torch.cat(
-                (trainenc_prompt.input_ids, trainenc_response.input_ids[:, 1:]), dim=1
-            )  # to remove the first token of the response ('1')
+            if model_family == "llama3":
+                raw_prompt = traindata_sampled["prompt"][i]
+                raw_prompt = raw_prompt.replace("[INST]", "").replace("[/INST]", "").strip()
+                messages = [{"role": "user", "content": raw_prompt}]
+                prompt_text = tokenizer.apply_chat_template(
+                    messages, tokenize=False, add_generation_prompt=True
+                )
+                # apply_chat_template already includes <|begin_of_text|>, so
+                # use add_special_tokens=False to avoid a duplicate BOS token.
+                trainenc_prompt = tokenizer(prompt_text, return_tensors="pt", add_special_tokens=False)
+                trainenc_response = tokenizer(
+                    traindata_sampled["response"][i], return_tensors="pt", add_special_tokens=False
+                )
+                # Neither part has an extra BOS, so concatenate directly
+                # (no [:, 1:] needed on response).
+                inp = torch.cat(
+                    (trainenc_prompt.input_ids, trainenc_response.input_ids), dim=1
+                )
+            else:
+                trainenc_prompt = tokenizer(
+                    traindata_sampled["prompt"][i], return_tensors="pt"
+                )
+                trainenc_response = tokenizer(
+                    traindata_sampled["response"][i], return_tensors="pt"
+                )
+                # Llama-2 tokenizer adds BOS to both; skip the response BOS.
+                inp = torch.cat(
+                    (trainenc_prompt.input_ids, trainenc_response.input_ids[:, 1:]), dim=1
+                )  # to remove the first token of the response ('1')
             tar = inp.clone()
             trainenc_prompt_len = trainenc_prompt.input_ids.shape[1]
             tar[:, :trainenc_prompt_len] = -100
@@ -129,7 +157,7 @@ def get_loaders(
     if name == "wikitext":
         return get_wikitext2(nsamples, seed, seqlen, tokenizer)
     if name in ["alpaca", "alpaca_cleaned", "alpaca_cleaned_no_safety"]:
-        return get_alpaca(nsamples, seed, seqlen, tokenizer, disentangle, dataset=name)
+        return get_alpaca(nsamples, seed, seqlen, tokenizer, disentangle, dataset=name, model_family=model_family)
     if name == "align":
         return get_align(nsamples, seed, seqlen, tokenizer, disentangle=disentangle, model_family=model_family)
     if name == "align_short":

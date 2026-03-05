@@ -4,7 +4,6 @@ import numpy as np
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from importlib.metadata import version
-from vllm import LLM
 
 from lib.prune import (
     prune_wanda,
@@ -20,7 +19,7 @@ from lib.prune import (
 )
 from lib.model_wrapper import prune_wanda_v2, prune_wandg
 from lib.model_wrapper_low import make_low_rank
-from lib.eval import eval_ppl, eval_zero_shot, eval_attack
+from lib.eval import eval_ppl, eval_zero_shot
 
 print("torch", version("torch"))
 print("transformers", version("transformers"))
@@ -187,102 +186,81 @@ def main():
         pruned_path = os.path.join(SAVE_PATH, f"tmp_vllm_model")
         model.save_pretrained(pruned_path)
         tokenizer.save_pretrained(pruned_path)
-        vllm_model = LLM(
-            model=pruned_path,
-            tokenizer=pruned_path,
-            dtype="bfloat16",
-            swap_space=64,
-            max_model_len=4096,
+        
+        # ---- Aggressively free ALL GPU memory ----
+        import gc
+        
+        # Remove accelerate dispatch hooks if present (device_map="auto")
+        try:
+            from accelerate.hooks import remove_hook_from_submodules
+            remove_hook_from_submodules(model)
+        except Exception:
+            pass
+        
+        # Move ALL parameters and buffers to CPU individually
+        # (model.cpu() may not work properly with accelerate's device_map)
+        for param in model.parameters():
+            param.data = param.data.cpu()
+            if param.grad is not None:
+                param.grad = param.grad.cpu()
+        for buf in model.buffers():
+            buf.data = buf.data.cpu()
+        
+        del model
+        del tokenizer
+        # Also convert ppl_test to plain float if it's a CUDA tensor
+        if isinstance(ppl_test, torch.Tensor):
+            ppl_test = ppl_test.item()
+        
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+        torch.cuda.synchronize()
+        gc.collect()
+        
+        # Report GPU memory state after initial cleanup
+        free_mem = torch.cuda.mem_get_info(0)[0] / 1024**3
+        total_mem = torch.cuda.mem_get_info(0)[1] / 1024**3
+        alloc_mem = torch.cuda.memory_allocated(0) / 1024**3
+        reserved_mem = torch.cuda.memory_reserved(0) / 1024**3
+        print(f"[Parent] GPU after empty_cache: free={free_mem:.2f} GiB, total={total_mem:.2f} GiB, "
+              f"allocated={alloc_mem:.2f} GiB, reserved={reserved_mem:.2f} GiB")
+        
+        # Destroy the CUDA primary context to release ALL GPU memory
+        # (including CUDA context overhead). After this, parent must NOT use CUDA.
+        import ctypes
+        try:
+            torch.cuda.empty_cache()
+            libcuda = ctypes.CDLL("libcuda.so.1")
+            result = libcuda.cuDevicePrimaryCtxReset(ctypes.c_int(0))
+            print(f"[Parent] cuDevicePrimaryCtxReset result: {result} (0=success)")
+        except Exception as e:
+            print(f"[Parent] Warning: Could not reset CUDA context: {e}")
+
+        # Launch vLLM attack evaluation in a fresh subprocess so that the
+        # parent process's CUDA context (which holds ~15 GiB) does not
+        # interfere.  The subprocess gets a clean GPU.
+        import subprocess, sys, json
+
+        attack_script = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                     "_run_attack_eval.py")
+        attack_args = json.dumps({
+            "pruned_path": os.path.abspath(pruned_path),
+            "save_attackpath": os.path.abspath(save_attackpath),
+            "model_family": model_family,
+            "save_attack_res": args.save_attack_res,
+            "save_filepath": os.path.abspath(save_filepath),
+            "prune_method": args.prune_method,
+            "rank": args.rank,
+        })
+        ret = subprocess.run(
+            [sys.executable, attack_script, attack_args],
+            cwd=os.path.dirname(os.path.abspath(__file__)),
         )
-        for include_inst in [True, False]:
-            suffix = "inst_" if include_inst else "no_inst_"
-            print("********************************")
-
-            score = eval_attack(
-                vllm_model,
-                tokenizer,
-                num_sampled=1,
-                add_sys_prompt=True,
-                do_sample=False,
-                save_attack_res=args.save_attack_res,
-                include_inst=include_inst,
-                filename=os.path.join(save_attackpath, f"{suffix}basic.jsonl"),
-                model_family=model_family,
-            )
-            print(f"attack evaluation results ({suffix}basic): {score:.4f}")
-            with open(save_filepath, "a") as f:
-                print(
-                    f"{args.prune_method}\t{args.rank}\t{suffix}ASR_basic\t{score:.4f}",
-                    file=f,
-                    flush=True,
-                )
-
-            print("********************************")
-            score = eval_attack(
-                vllm_model,
-                tokenizer,
-                num_sampled=1,
-                add_sys_prompt=False,
-                do_sample=False,
-                save_attack_res=args.save_attack_res,
-                include_inst=include_inst,
-                filename=os.path.join(save_attackpath, f"{suffix}basic_no_sys.jsonl"),
-                model_family=model_family,
-            )
-            print(
-                f"attack evaluation results ({suffix}basic, no sys prompt): {score:.4f}"
-            )
-            with open(save_filepath, "a") as f:
-                print(
-                    f"{args.prune_method}\t{args.rank}\t{suffix}ASR_basic_nosys\t{score:.4f}",
-                    file=f,
-                    flush=True,
-                )
-
-            print("********************************")
-            score = eval_attack(
-                vllm_model,
-                tokenizer,
-                num_sampled=5,
-                add_sys_prompt=False,
-                do_sample=True,
-                save_attack_res=args.save_attack_res,
-                include_inst=include_inst,
-                filename=os.path.join(
-                    save_attackpath, f"{suffix}multiple_no_sys.jsonl"
-                ),
-                model_family=model_family,
-            )
-            print(
-                f"attack evaluation results ({suffix}multiple, no sys prompt): {score:.4f}"
-            )
-            with open(save_filepath, "a") as f:
-                print(
-                    f"{args.prune_method}\t{args.rank}\t{suffix}ASR_multiple_nosys\t{score:.4f}",
-                    file=f,
-                    flush=True,
-                )
-        if model_family == "llama2":
-            score = eval_attack(
-                vllm_model,
-                tokenizer,
-                num_sampled=1,
-                add_sys_prompt=False,
-                gcg=True,
-                do_sample=False,
-                save_attack_res=args.save_attack_res,
-                include_inst=True,
-                filename=os.path.join(save_attackpath, f"gcg.jsonl"),
-                model_family=model_family,
-            )
-            print(f"attack evaluation results (gcg): {score:.4f}")
-            with open(save_filepath, "a") as f:
-                print(
-                    f"{args.prune_method}\t{args.rank}\tASR_gcg\t{score:.4f}",
-                    file=f,
-                    flush=True,
-                )
-        del vllm_model
+        if ret.returncode != 0:
+            print(f"ERROR: attack eval subprocess exited with code {ret.returncode}")
+        else:
+            print("Attack evaluation subprocess completed successfully.")
 
     if args.eval_zero_shot:
         accelerate = False

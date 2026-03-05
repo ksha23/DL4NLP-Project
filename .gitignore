@@ -1,6 +1,7 @@
 **/llm_weights/
 **/results/
 **/temp/
+**/ortho_model/
 **/__pycache__/
 *.pyc
 **/.locks/
